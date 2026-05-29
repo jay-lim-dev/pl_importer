@@ -463,7 +463,7 @@ function renderConfirmationScreen(analyzedRows) {
   renderSimpleBucket('bucket-skip', skip);
   renderSimpleBucket('bucket-nomatch', noMatch);
 
-  document.getElementById('btn-run-import').disabled = ready.length === 0;
+  document.getElementById('btn-run-import').disabled = ready.length === 0 && review.length === 0;
   showScreen('screen-confirm');
 }
 
@@ -885,7 +885,7 @@ function init() {
 
   Promise.all([
     ZOHO.CRM.CONFIG.getCurrentUser().then(function(d) {
-      state.currentUser = d;
+      state.currentUser = (d && d.users && d.users[0]) ? d.users[0] : d;
     }).catch(function() {}),
     ZOHO.CRM.API.getAllUsers({ Type: 'ActiveUsers' }).then(function(d) {
       var users = (d && d.users) ? d.users : [];

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PL Importer</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://live.zwidgets.com/js-sdk/1.2/ZohoEmbededAppSDK.min.js"></script>
+</head>
+<body>
+
+  <!-- Screen 1: Upload -->
+  <div id="screen-upload" class="screen active">
+    <div class="container">
+      <div class="page-header">
+        <h1>PL Importer</h1>
+        <p>Upload a monthly PL loans spreadsheet to transition matching deals through the blueprint.</p>
+      </div>
+      <div id="upload-form">
+        <div id="drop-zone" class="drop-zone" role="button" tabindex="0">
+          <div class="drop-icon">&#128196;</div>
+          <p class="drop-primary">Drag &amp; drop your <strong>.xlsx</strong> file here</p>
+          <p class="drop-secondary">or click to browse</p>
+          <input type="file" id="file-input" accept=".xlsx,.csv">
+        </div>
+        <div id="upload-error" class="alert alert-error" style="display:none"></div>
+      </div>
+      <div id="upload-spinner" class="spinner-wrap" style="display:none">
+        <div class="spinner"></div>
+        <p id="analysis-progress" class="spinner-label">Preparing...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 2: Confirmation -->
+  <div id="screen-confirm" class="screen">
+    <div class="container">
+      <div class="page-header">
+        <h1>Review Import</h1>
+        <p>Check the results below before running. Review rows with checkboxes can be included or excluded.</p>
+      </div>
+
+      <div class="summary-bar">
+        <span class="sum-item sum-ready">&#9989; <strong id="summary-ready">0</strong> ready</span>
+        <span class="sum-item sum-review">&#9888; <strong id="summary-review">0</strong> need review</span>
+        <span class="sum-item sum-fix">&#9888;&#65038; <strong id="summary-fix">0</strong> fix required</span>
+        <span class="sum-item sum-skip">&#128260; <strong id="summary-skip">0</strong> already done</span>
+        <span class="sum-item sum-nomatch">&#10060; <strong id="summary-nomatch">0</strong> no match</span>
+      </div>
+
+      <div class="section-card">
+        <div class="section-hdr" onclick="toggleSection('bucket-ready')">
+          <span>&#9989; Ready to import</span>
+          <span class="toggle-icon" id="toggle-bucket-ready">&#9660;</span>
+        </div>
+        <div id="bucket-ready" class="section-body"></div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-hdr" onclick="toggleSection('bucket-review')">
+          <span>&#9888; Review before importing</span>
+          <span class="toggle-icon" id="toggle-bucket-review">&#9660;</span>
+        </div>
+        <div id="bucket-review" class="section-body"></div>
+      </div>
+
+      <div class="section-card section-card-fix">
+        <div class="section-hdr section-hdr-fix" onclick="toggleSection('bucket-fix')">
+          <span>&#9888;&#65038; Fix required — will be skipped</span>
+          <span class="toggle-icon" id="toggle-bucket-fix">&#9660;</span>
+        </div>
+        <div id="bucket-fix" class="section-body">
+          <p class="fix-banner">These rows cannot be imported this run. Correct the issues below and re-upload.</p>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-hdr" onclick="toggleSection('bucket-skip')">
+          <span>&#128260; Already done</span>
+          <span class="toggle-icon" id="toggle-bucket-skip">&#9660;</span>
+        </div>
+        <div id="bucket-skip" class="section-body"></div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-hdr" onclick="toggleSection('bucket-nomatch')">
+          <span>&#10060; No match found</span>
+          <span class="toggle-icon" id="toggle-bucket-nomatch">&#9660;</span>
+        </div>
+        <div id="bucket-nomatch" class="section-body"></div>
+      </div>
+
+      <div class="action-bar">
+        <button id="btn-run-import" class="btn btn-primary" disabled>Run Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 3: Execution Progress -->
+  <div id="screen-progress" class="screen">
+    <div class="container">
+      <div class="page-header">
+        <h1>Importing&hellip;</h1>
+        <p>Please wait &mdash; do not close this window.</p>
+      </div>
+      <div id="progress-list" class="progress-list"></div>
+    </div>
+  </div>
+
+  <!-- Screen 4: Audit Report -->
+  <div id="screen-audit" class="screen">
+    <div class="container container-wide">
+      <div class="page-header">
+        <h1>Import Report</h1>
+        <p id="audit-run-info" class="run-info"></p>
+      </div>
+      <div id="audit-summary" class="audit-summary"></div>
+      <div class="audit-actions">
+        <button id="btn-export-csv" class="btn btn-secondary">Export CSV</button>
+        <button id="btn-new-import" class="btn btn-outline">&#8592; New Import</button>
+      </div>
+      <div class="table-wrap">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>Client Name</th>
+              <th>Email</th>
+              <th>Outcome</th>
+              <th>Transition</th>
+              <th>Deal ID</th>
+              <th>Match Method</th>
+              <th>Rep Resolved</th>
+              <th>Error</th>
+              <th>Timestamp</th>
+            </tr>
+          </thead>
+          <tbody id="audit-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

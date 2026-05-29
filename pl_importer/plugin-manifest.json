@@ -1,0 +1,14 @@
+{
+  "service": "CRM",
+  "name": "PL Importer",
+  "version": "1.0",
+  "platform_version": "1.0",
+  "modules": {
+    "widgets": [
+      {
+        "location": "crm.webtab",
+        "url": "app/widget.html"
+      }
+    ]
+  }
+}

@@ -462,21 +462,29 @@ function analyzeAllRows(rows, onProgress) {
   var completed   = 0;
 
   return new Promise(function(resolve) {
+    function finish(idx, result) {
+      results[idx] = result;
+      completed++;
+      if (onProgress) onProgress(completed, rows.length);
+      if (completed === rows.length) resolve(results);
+      else startNext();
+    }
+
     function startNext() {
       if (started >= rows.length) return;
       var idx = started++;
       analyzeRow(rows[idx]).then(function(result) {
-        results[idx] = result;
-        completed++;
-        if (onProgress) onProgress(completed, rows.length);
-        if (completed === rows.length) {
-          resolve(results);
-        } else {
-          startNext();
-        }
+        finish(idx, result);
+      }).catch(function(err) {
+        // Row analysis failed — include as no_match so it appears in the audit
+        finish(idx, {
+          row: rows[idx], bucket: 'no_match',
+          reason: 'Analysis error: ' + String(err),
+          rep: { userId: CONSTANTS.KYLE_USER_ID, resolvedName: CONSTANTS.KYLE_NAME, confidence: null, defaulted: true, flagged: false },
+          deal: null, tier: null
+        });
       });
     }
-    // Seed the initial batch
     var seed = Math.min(CONCURRENCY, rows.length);
     for (var i = 0; i < seed; i++) startNext();
   });
@@ -791,7 +799,7 @@ function runImport() {
 
 function buildSkipAndNoMatchAuditEntries() {
   state.analyzedRows.forEach(function(r) {
-    // Skip rows already added via processNext (ready + included review rows)
+    if (!r || !r.row) return; // guard against undefined entries
     var wasProcessed = (r.bucket === 'ready') ||
                        (r.bucket === 'review' && r.transition && r.deal && r.includeInRun);
     if (wasProcessed) return;
@@ -809,7 +817,7 @@ function buildSkipAndNoMatchAuditEntries() {
     };
 
     if (r.bucket === 'skip') {
-      entry.outcome = 'Skipped';
+      entry.outcome = 'Already Done';
     } else if (r.bucket === 'no_match') {
       entry.outcome = 'No Match';
     } else if (r.bucket === 'review' && r.subReason === 'pending_clarification') {
@@ -835,10 +843,19 @@ function renderAuditReport() {
   var runUser = state.currentUser
     ? (state.currentUser.full_name || state.currentUser.email || 'Unknown')
     : 'Unknown';
+  var totalRows  = state.parsedRows.length;
+  var auditTotal = state.auditLog.length;
+  var countNote  = totalRows !== auditTotal
+    ? '  ·  ⚠️ ' + (totalRows - auditTotal) + ' rows missing from report (check console)'
+    : '';
+  if (totalRows !== auditTotal) {
+    console.warn('Audit mismatch: ' + totalRows + ' parsed rows but only ' + auditTotal + ' audit entries.');
+  }
   document.getElementById('audit-run-info').textContent =
-    'Run by: ' + runUser + '  ·  ' + new Date().toLocaleString();
+    'Run by: ' + runUser + '  ·  ' + new Date().toLocaleString() +
+    '  ·  ' + totalRows + ' rows in file' + countNote;
 
-  var counts = { Transitioned: 0, Skipped: 0, Failed: 0, 'No Match': 0, 'Pending Clarification': 0 };
+  var counts = { Transitioned: 0, 'Already Done': 0, Skipped: 0, Failed: 0, 'No Match': 0, 'Pending Clarification': 0, 'Fix Required': 0 };
   state.auditLog.forEach(function(l) {
     var k = l.outcome.startsWith('Skipped') ? 'Skipped' : l.outcome;
     if (counts[k] !== undefined) counts[k]++;
@@ -846,10 +863,12 @@ function renderAuditReport() {
 
   document.getElementById('audit-summary').innerHTML =
     '<span class="audit-count transitioned">' + counts.Transitioned + ' transitioned</span>' +
+    '<span class="audit-count already-done">' + counts['Already Done'] + ' already done</span>' +
     '<span class="audit-count skipped">' + counts.Skipped + ' skipped</span>' +
     '<span class="audit-count failed">' + counts.Failed + ' failed</span>' +
     '<span class="audit-count nomatch">' + counts['No Match'] + ' no match</span>' +
-    '<span class="audit-count pending">' + counts['Pending Clarification'] + ' pending</span>';
+    '<span class="audit-count pending">' + counts['Pending Clarification'] + ' pending</span>' +
+    '<span class="audit-count fix-required">' + counts['Fix Required'] + ' fix required</span>';
 
   var rows = '';
   state.auditLog.forEach(function(l) {

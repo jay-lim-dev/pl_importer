@@ -140,8 +140,11 @@ function parseXlsx(file) {
       try {
         var workbook = XLSX.read(e.target.result, { type: 'array', cellDates: true });
         var sheet = workbook.Sheets[workbook.SheetNames[0]];
+        // Read header row directly so empty cells in row 1 data don't hide column names
+        var headerRow = (XLSX.utils.sheet_to_json(sheet, { header: 1 })[0] || [])
+          .map(function(h) { return String(h || '').trim(); });
         var rows = XLSX.utils.sheet_to_json(sheet, { raw: false, dateNF: 'yyyy-mm-dd' });
-        resolve(rows);
+        resolve({ rows: rows, headers: headerRow });
       } catch (err) {
         reject(err);
       }
@@ -151,9 +154,8 @@ function parseXlsx(file) {
   });
 }
 
-function validateColumns(rows) {
-  if (!rows || rows.length === 0) throw new Error('The file appears to be empty.');
-  var headers = Object.keys(rows[0]);
+function validateColumns(headers) {
+  if (!headers || headers.length === 0) throw new Error('The file appears to be empty.');
   CONSTANTS.REQUIRED_COLUMNS.forEach(function(col) {
     if (!headers.includes(col)) {
       throw new Error("Column '" + col + "' not found — please check the file format.");
@@ -855,12 +857,18 @@ function handleFile(file) {
   hideError();
   setLoading(true, 'Parsing file…');
 
-  parseXlsx(file).then(function(rows) {
+  parseXlsx(file).then(function(result) {
+    var rows = result.rows;
     try {
-      validateColumns(rows);
+      validateColumns(result.headers);
     } catch (e) {
       setLoading(false);
       showError(e.message);
+      return;
+    }
+    if (rows.length === 0) {
+      setLoading(false);
+      showError('The file appears to be empty.');
       return;
     }
     state.parsedRows = rows;

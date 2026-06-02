@@ -68,14 +68,61 @@ function setProgress(msg) {
 
 function formatApiError(resp) {
   if (!resp) return 'No response from API';
-  var code = resp.code || '';
-  var msg  = resp.message || '';
-  if (code === 'RATE_LIMIT' || code === 'API_LIMIT_EXCEEDED') {
-    return 'API call limit reached — wait before retrying (code: ' + code + ')';
+  if (typeof resp === 'string') return resp;
+  var code    = resp.code    || '';
+  var msg     = resp.message || '';
+  var details = resp.details || {};
+  var field   = details.api_name || details.field_name || '';
+  var dtype   = details.expected_data_type || '';
+
+  switch (code) {
+    case 'INVALID_DATA':
+      return 'Invalid value' + (field ? ' for field "' + field + '"' : '') +
+             (dtype ? ' — expected type: ' + dtype : '') +
+             '. Check the value in the spreadsheet.';
+    case 'MANDATORY_NOT_FOUND':
+      return 'Required transition field missing' + (field ? ': "' + field + '"' : '') + '.';
+    case 'RATE_LIMIT':
+    case 'API_LIMIT_EXCEEDED':
+      return 'API call limit reached — wait before retrying.';
+    case 'OAUTH_SCOPE_MISMATCH':
+    case 'NO_PERMISSION':
+      return 'Permission denied — check CRM user permissions for blueprint transitions.';
+    case 'RECORD_LOCKED':
+      return 'Record is locked in CRM — unlock it before importing.';
+    case 'INVALID_TOKEN':
+      return 'Authentication expired — refresh the widget and try again.';
+    case 'DUPLICATE_DATA':
+      return 'Duplicate data' + (field ? ' for field "' + field + '"' : '') + '.';
+    case 'BLUEPRINT_TRANSITION_ERROR':
+      return 'Blueprint transition error — deal may not be in the correct state.';
+    default:
+      if (code && msg) return code + ': ' + msg;
+      if (msg) return msg;
+      return JSON.stringify(resp);
   }
-  if (code && msg) return code + ': ' + msg;
-  if (msg) return msg;
-  return JSON.stringify(resp);
+}
+
+// Converts Excel serial numbers AND already-formatted strings to YYYY-MM-DD
+function normalizeDate(val) {
+  if (!val) return '';
+  var s = String(val).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;                   // already ISO
+  if (/^\d{4}\/\d{2}\/\d{2}$/.test(s)) return s.replace(/\//g, '-'); // YYYY/MM/DD
+  var serial = parseFloat(s);
+  if (!isNaN(serial) && serial > 1000) {                           // Excel serial
+    var d = new Date(Math.round((serial - 25569) * 86400 * 1000));
+    var mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    var dd = String(d.getUTCDate()).padStart(2, '0');
+    return d.getUTCFullYear() + '-' + mm + '-' + dd;
+  }
+  var parsed = new Date(s);                                        // fallback parse
+  if (!isNaN(parsed)) {
+    var mm2 = String(parsed.getMonth() + 1).padStart(2, '0');
+    var dd2 = String(parsed.getDate()).padStart(2, '0');
+    return parsed.getFullYear() + '-' + mm2 + '-' + dd2;
+  }
+  return s;
 }
 
 function getMissingFields(row) {
@@ -488,7 +535,7 @@ function renderReadyBucket(rows) {
     html += '<p><strong>Transition:</strong> ' + escapeHtml(r.transition.label) + '</p>';
     html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + (r.rep.confidence !== null && !r.rep.defaulted ? ' (' + Math.round(r.rep.confidence * 100) + '% confidence)' : '') + '</p>';
     html += '<p><strong>Loan Amount:</strong> ' + escapeHtml(r.row['Loan Amount']) + ' &nbsp; <strong>Revenue:</strong> ' + escapeHtml(r.row['Ref Fee']) + '</p>';
-    html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(r.row['Date Enrolled in PL']) + '</p>';
+    html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Date Enrolled in PL'])) + '</p>';
     html += '</div></div>';
   });
   el.innerHTML = html;
@@ -665,7 +712,7 @@ function runImport() {
     statusEl.textContent = 'Processing…';
     statusEl.className = 'progress-status status-processing';
 
-    var enrolledDate = (r.row['Date Enrolled in PL'] || '').trim();
+    var enrolledDate = normalizeDate(r.row['Date Enrolled in PL']);
     var loanAmount   = parseFloat(String(r.row['Loan Amount']).replace(/[^0-9.]/g, '')) || 0;
     var refFee       = parseFloat(String(r.row['Ref Fee']).replace(/[^0-9.]/g, '')) || 0;
 
@@ -734,8 +781,8 @@ function runImport() {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutId);
-      console.error('updateBluePrint rejected:', err);
-      recordOutcome(false, String(err));
+      console.error('updateBluePrint rejected:', JSON.stringify(err));
+      recordOutcome(false, formatApiError(err));
     });
   }
 

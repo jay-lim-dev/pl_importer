@@ -70,8 +70,9 @@ The widget accepts `.xlsx` and `.csv` files with **exactly** these column header
 | `Email` | Deal matching (Tier 1) | — |
 | `Phone` | Deal matching (Tier 2) | — |
 | `Stage` | Determines transition | — |
+| `Cancellation Date` | PL Canceled Date (chargeback rows only) | `PL_Canceled_Date` |
 
-Any missing column halts the import with a clear error message.
+`Cancellation Date` is required as a column header but the per-row value is only used for chargeback rows. Any missing column halts the import with a clear error message.
 
 ---
 
@@ -100,11 +101,21 @@ Affiliate Rep values are fuzzy-matched against CRM active users:
 
 ### Stage → Blueprint Transition Mapping
 
-| Spreadsheet Stage | Transition | Transition ID |
-|---|---|---|
-| `Closed-Won` | Enrolled PL | `5428089000006963030` |
-| `CHARGEBACK`, `CHARGABACK` | Pending clarification — skipped | — |
-| `FEE ADJUSTMENT`, `Fee Adjustment` | Pending clarification — skipped | — |
+Row type is determined by **cross-validating** the `Stage` column with the `Cancellation Date` column. Both must agree, or the row is flagged for Fix Required.
+
+| Spreadsheet Stage | Cancellation Date | Transition | Transition ID |
+|---|---|---|---|
+| `Closed-Won` | blank | `Sent to PL → Enrolled PL` | `5428089000006963030` |
+| `CHARGEBACK` / `CHARGABACK` (case-insensitive, ignores spaces/dashes) | populated | `Enrolled PL → Canceled PL` | `5428089000739384025` |
+| `FEE ADJUSTMENT` / `Fee Adjustment` | — | Pending clarification — skipped | — |
+| `CHARGEBACK` variant | **blank** | Fix Required — missing Cancellation Date | — |
+| `Closed-Won` | **populated** | Fix Required — Cancellation Date set but Stage isn't CHARGEBACK | — |
+
+### Two-Pass Processing Order
+
+When the file contains both enrollment and chargeback rows for the same deal (same-month scenario), the importer always processes **all enrollments first**, then chargebacks. This guarantees that a deal is in `Enrolled PL` before its chargeback row tries to cancel it.
+
+For chargeback rows, the importer **re-fetches the deal's current stage** immediately before the cancellation transition. If the deal isn't in `Enrolled PL` at that point (e.g. the enrollment failed, or the deal moved elsewhere), the row is logged as failed with: `Deal not in Enrolled PL stage — cannot cancel (currently: ...)`.
 
 ---
 
@@ -152,6 +163,7 @@ Transition IDs:
 enrolled_pl:    '5428089000006963030'
 ghosted_pl:     '5428089000006963038'
 turned_down_pl: '5428089000280561156'
+canceled_pl:    '5428089000739384025'
 ```
 
 ---
@@ -168,8 +180,7 @@ turned_down_pl: '5428089000280561156'
 
 ## Open Items (V2)
 
-- [ ] Wire up Chargeback and Fee Adjustment transitions once Jeff confirms target stage
+- [ ] Wire up Fee Adjustment transition once Jeff confirms target stage
 - [ ] Inline deal picker for multiple-candidate rows
 - [ ] Column mapping UI on upload (V1 uses rigid column check only)
-- [ ] Chargeback → Enrolled PL → Clawback two-step flow
 - [ ] Scheduled/automated monthly run

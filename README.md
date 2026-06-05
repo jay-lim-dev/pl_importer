@@ -72,7 +72,7 @@ The widget accepts `.xlsx` and `.csv` files with **exactly** these column header
 | `Stage` | Determines transition | — |
 | `Cancellation Date` | PL Canceled Date (chargeback rows only) | `PL_Canceled_Date` |
 
-`Cancellation Date` is required as a column header but the per-row value is only used for chargeback rows. Any missing column halts the import with a clear error message.
+`Cancellation Date` is optional — only needed if the file contains chargeback rows. If the column is absent and a row has `Stage = CHARGEBACK`, that row is flagged as Fix Required. All other required columns halt the import if missing.
 
 ---
 

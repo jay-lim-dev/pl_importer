@@ -132,6 +132,19 @@ body {
 
 .review-checkbox { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
 
+.badge-chargeback {
+  display: inline-block;
+  padding: 2px 8px;
+  margin-left: 6px;
+  background: #fce8e6;
+  color: #c5221f;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .row-item-fuzzy { background: #fff; }
 
 .rep-confirm-row {

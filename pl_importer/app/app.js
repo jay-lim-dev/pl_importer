@@ -5,17 +5,22 @@ var CONSTANTS = {
   TRANSITIONS: {
     enrolled_pl:    { id: '5428089000006963030', label: 'Enrolled PL' },
     ghosted_pl:     { id: '5428089000006963038', label: 'Ghosted PL' },
-    turned_down_pl: { id: '5428089000280561156', label: 'Turned Down for PL' }
+    turned_down_pl: { id: '5428089000280561156', label: 'Turned Down for PL' },
+    canceled_pl:    { id: '5428089000739384025', label: 'Canceled PL' }
   },
   STATUS_MAP: {
     'closed-won': 'enrolled_pl'
   },
-  PENDING_CLARIFICATION_STATUSES: ['chargeback', 'chargaback', 'fee adjustment'],
-  PL_END_STAGES: ['Enrolled PL', 'Ghosted PL', 'Turned Down for PL'],
+  // Normalized stage variants (lowercase + non-alphanumerics stripped)
+  CHARGEBACK_STAGE_NORM_VARIANTS: ['chargeback', 'chargaback'],
+  PENDING_CLARIFICATION_NORM_VARIANTS: ['feeadjustment'],
+  PL_END_STAGES: ['Enrolled PL', 'Ghosted PL', 'Turned Down for PL', 'Canceled PL'],
   SENT_TO_PL_STAGE: 'Sent to PL',
+  ENROLLED_PL_STAGE: 'Enrolled PL',
+  CANCELED_PL_STAGE: 'Canceled PL',
   FUZZY_MATCH_THRESHOLD: 0.6,
   UNASSIGNED_VALUES: ['unassigned', 'n/a', 'affiliates', 'sales agent', ''],
-  REQUIRED_COLUMNS: ['Affiliate Rep', 'Date Enrolled in PL', 'Client Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone', 'Stage'],
+  REQUIRED_COLUMNS: ['Affiliate Rep', 'Date Enrolled in PL', 'Client Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone', 'Stage', 'Cancellation Date'],
   CRM_ORG_ID: '786428921',
   FUZZY_READY_THRESHOLD: 0.85
 };
@@ -131,6 +136,18 @@ function getMissingFields(row) {
   if (!String(row['Loan Amount'] || '').trim()) missing.push('Loan Amount');
   if (!String(row['Date Enrolled in PL'] || '').trim()) missing.push('PL Enrolled Date');
   return missing;
+}
+
+function normalizeStage(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isChargebackStage(stageRaw) {
+  return CONSTANTS.CHARGEBACK_STAGE_NORM_VARIANTS.indexOf(normalizeStage(stageRaw)) !== -1;
+}
+
+function isFeeAdjustmentStage(stageRaw) {
+  return CONSTANTS.PENDING_CLARIFICATION_NORM_VARIANTS.indexOf(normalizeStage(stageRaw)) !== -1;
 }
 
 function repDisplayName(rep) {
@@ -352,17 +369,45 @@ function matchDeal(row) {
 // ─── Row Analysis ─────────────────────────────────────────────────────────────
 function analyzeRow(row) {
   var stageRaw = (row['Stage'] || '').trim();
-  var stageLower = stageRaw.toLowerCase();
+  var cancellationDate = String(row['Cancellation Date'] || '').trim();
   var rep = resolveRep(row['Affiliate Rep']);
 
-  if (CONSTANTS.PENDING_CLARIFICATION_STATUSES.includes(stageLower)) {
+  var isCharge = isChargebackStage(stageRaw);
+  var hasCancelDate = !!cancellationDate;
+
+  // Fee Adjustment → still pending clarification
+  if (isFeeAdjustmentStage(stageRaw)) {
     return Promise.resolve({
       row: row, bucket: 'review', subReason: 'pending_clarification',
-      reason: 'Chargeback/Fee Adjustment — pending clarification, will be skipped',
+      reason: 'Fee Adjustment — pending clarification, will be skipped',
       rep: rep, deal: null, tier: null
     });
   }
 
+  // Cross-validation: Stage and Cancellation Date must agree
+  if (isCharge && !hasCancelDate) {
+    return Promise.resolve({
+      row: row, bucket: 'review', subReason: 'missing_fields',
+      reason: 'Stage indicates CHARGEBACK but Cancellation Date is blank — fill in the spreadsheet',
+      rep: rep, deal: null, tier: null
+    });
+  }
+  if (!isCharge && hasCancelDate) {
+    return Promise.resolve({
+      row: row, bucket: 'review', subReason: 'missing_fields',
+      reason: 'Cancellation Date set but Stage is not CHARGEBACK — please correct one of them',
+      rep: rep, deal: null, tier: null
+    });
+  }
+
+  if (isCharge && hasCancelDate) {
+    return analyzeChargebackRow(row, rep, stageRaw);
+  }
+  return analyzeEnrollmentRow(row, rep, stageRaw);
+}
+
+function analyzeEnrollmentRow(row, rep, stageRaw) {
+  var stageLower = stageRaw.toLowerCase();
   var transitionKey = CONSTANTS.STATUS_MAP[stageLower];
   var transition = transitionKey ? CONSTANTS.TRANSITIONS[transitionKey] : null;
 
@@ -387,7 +432,6 @@ function analyzeRow(row) {
     var dealStage = deal.Stage || '';
 
     if (otherStage) {
-      // Deal found but NOT in Sent to PL
       if (CONSTANTS.PL_END_STAGES.includes(dealStage)) {
         var skipReason = 'Already in ' + dealStage;
         if (dealStage.toLowerCase() !== stageRaw.toLowerCase()) {
@@ -410,7 +454,6 @@ function analyzeRow(row) {
       };
     }
 
-    // Validate required fields before any actionable outcome
     var missingFields = getMissingFields(row);
     if (missingFields.length > 0) {
       return {
@@ -420,7 +463,6 @@ function analyzeRow(row) {
       };
     }
 
-    // Name-only match → low-confidence review
     if (tier === 'Name') {
       var nameReason = 'Name-only match — low confidence';
       if (rep.flagged) nameReason += '; rep unresolvable — will default to Kyle (was: "' + rep.originalName + '")';
@@ -431,7 +473,6 @@ function analyzeRow(row) {
       };
     }
 
-    // Rep unresolvable → review, checkbox only, defaults to Kyle
     if (rep.flagged) {
       return {
         row: row, bucket: 'review', subReason: 'rep_unresolvable',
@@ -441,7 +482,6 @@ function analyzeRow(row) {
       };
     }
 
-    // Rep fuzzy-matched below high-confidence threshold → review with rep selector
     if (!rep.defaulted && rep.confidence !== null && rep.confidence < CONSTANTS.FUZZY_READY_THRESHOLD) {
       return {
         row: row, bucket: 'review', subReason: 'rep_fuzzy',
@@ -452,6 +492,66 @@ function analyzeRow(row) {
     }
 
     return { row: row, bucket: 'ready', rep: rep, deal: deal, tier: tier, transition: transition };
+  });
+}
+
+function analyzeChargebackRow(row, rep, stageRaw) {
+  var transition = CONSTANTS.TRANSITIONS.canceled_pl;
+
+  // Chargeback row matches deal at ANY stage (Enrolled PL or Sent to PL for same-month)
+  return tryTiers(row, null).then(function(result) {
+    var deals = result.deals;
+    var tier  = result.tier;
+
+    if (deals.length === 0) {
+      return {
+        row: row, bucket: 'no_match', reason: 'No match found',
+        rep: rep, deal: null, tier: null, isChargeback: true
+      };
+    }
+
+    if (deals.length > 1) {
+      return {
+        row: row, bucket: 'review', subReason: 'multiple_candidates',
+        reason: deals.length + ' deals found — go to CRM, resolve the duplicate, then re-upload',
+        rep: rep, deal: null, allDeals: deals, tier: tier, isChargeback: true
+      };
+    }
+
+    var deal = deals[0];
+    var dealStage = deal.Stage || '';
+
+    if (dealStage === CONSTANTS.CANCELED_PL_STAGE) {
+      return {
+        row: row, bucket: 'skip', reason: 'Already in ' + dealStage,
+        rep: rep, deal: deal, tier: tier, isChargeback: true
+      };
+    }
+
+    if (dealStage !== CONSTANTS.ENROLLED_PL_STAGE && dealStage !== CONSTANTS.SENT_TO_PL_STAGE) {
+      return {
+        row: row, bucket: 'review', subReason: 'wrong_stage_for_cancel',
+        reason: 'Cannot cancel — deal is in "' + dealStage + '" (must be Enrolled PL, or Sent to PL with a matching enrollment row)',
+        rep: rep, deal: deal, tier: tier, isChargeback: true
+      };
+    }
+
+    if (tier === 'Name') {
+      var reason = 'Name-only match — low confidence';
+      if (dealStage === CONSTANTS.SENT_TO_PL_STAGE) {
+        reason += ' (depends on enrollment row processing first)';
+      }
+      return {
+        row: row, bucket: 'review', subReason: 'name_match',
+        reason: reason, rep: rep, deal: deal, tier: tier,
+        transition: transition, includeInRun: true, isChargeback: true
+      };
+    }
+
+    return {
+      row: row, bucket: 'ready', rep: rep, deal: deal, tier: tier,
+      transition: transition, isChargeback: true
+    };
   });
 }
 
@@ -529,21 +629,31 @@ function renderReadyBucket(rows) {
   if (rows.length === 0) { el.innerHTML = '<p class="empty-bucket">None</p>'; return; }
   var html = '';
   rows.forEach(function(r) {
-    var confStr = (r.rep.confidence !== null && r.rep.confidence < 1)
-      ? ' (' + Math.round(r.rep.confidence * 100) + '%)' : '';
     html += '<div class="row-item">';
     html += '<div class="row-summary clickable" onclick="toggleExpand(this)">';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']) + '</span>';
-    html += '<span class="row-meta">via ' + escapeHtml(r.tier) + ' &middot; ' + escapeHtml(repDisplayName(r.rep)) + escapeHtml(confStr) + '</span>';
+    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
+    html += '</span>';
+    if (r.isChargeback) {
+      html += '<span class="row-meta">via ' + escapeHtml(r.tier) + ' &middot; ' + escapeHtml(r.transition.label) + '</span>';
+    } else {
+      var confStr = (r.rep.confidence !== null && r.rep.confidence < 1)
+        ? ' (' + Math.round(r.rep.confidence * 100) + '%)' : '';
+      html += '<span class="row-meta">via ' + escapeHtml(r.tier) + ' &middot; ' + escapeHtml(repDisplayName(r.rep)) + escapeHtml(confStr) + '</span>';
+    }
     html += '<span class="expand-arrow">&#9654;</span>';
     html += '</div>';
     html += '<div class="row-detail" style="display:none">';
     html += '<p><strong>Deal:</strong> ' + dealLinkHtml(r.deal) + '</p>';
     html += '<p><strong>Match method:</strong> ' + escapeHtml(r.tier) + '</p>';
     html += '<p><strong>Transition:</strong> ' + escapeHtml(r.transition.label) + '</p>';
-    html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + (r.rep.confidence !== null && !r.rep.defaulted ? ' (' + Math.round(r.rep.confidence * 100) + '% confidence)' : '') + '</p>';
-    html += '<p><strong>Loan Amount:</strong> ' + escapeHtml(r.row['Loan Amount']) + ' &nbsp; <strong>Revenue:</strong> ' + escapeHtml(r.row['Ref Fee']) + '</p>';
-    html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Date Enrolled in PL'])) + '</p>';
+    if (r.isChargeback) {
+      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Cancellation Date'])) + '</p>';
+    } else {
+      html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + (r.rep.confidence !== null && !r.rep.defaulted ? ' (' + Math.round(r.rep.confidence * 100) + '% confidence)' : '') + '</p>';
+      html += '<p><strong>Loan Amount:</strong> ' + escapeHtml(r.row['Loan Amount']) + ' &nbsp; <strong>Revenue:</strong> ' + escapeHtml(r.row['Ref Fee']) + '</p>';
+      html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Date Enrolled in PL'])) + '</p>';
+    }
     html += '</div></div>';
   });
   el.innerHTML = html;
@@ -554,12 +664,14 @@ function renderReviewOnlyBucket(rows) {
   if (rows.length === 0) { el.innerHTML = '<p class="empty-bucket">None</p>'; return; }
   var html = '<p class="review-hint">Uncheck any row to exclude it from this import run.</p>';
   rows.forEach(function(r) {
-    var isFuzzy = r.subReason === 'rep_fuzzy';
+    var isFuzzy = r.subReason === 'rep_fuzzy' && !r.isChargeback;
     html += '<div class="row-item' + (isFuzzy ? ' row-item-fuzzy' : '') + '">';
 
     html += '<div class="row-summary clickable" onclick="toggleExpand(this)">';
     html += '<input type="checkbox" class="review-checkbox" data-analyzed-idx="' + r._analyzedIdx + '" ' + (r.includeInRun ? 'checked' : '') + ' onclick="event.stopPropagation()">';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']) + '</span>';
+    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
+    html += '</span>';
     html += '<span class="row-reason warning">' + escapeHtml(r.reason) + '</span>';
     html += '<span class="expand-arrow">&#9654;</span>';
     html += '</div>';
@@ -576,7 +688,11 @@ function renderReviewOnlyBucket(rows) {
     html += '<p><strong>Deal:</strong> ' + dealLinkHtml(r.deal) + '</p>';
     html += '<p><strong>Match method:</strong> ' + escapeHtml(r.tier) + '</p>';
     if (r.transition) html += '<p><strong>Transition:</strong> ' + escapeHtml(r.transition.label) + '</p>';
-    if (!isFuzzy) html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + '</p>';
+    if (r.isChargeback) {
+      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Cancellation Date'])) + '</p>';
+    } else if (!isFuzzy) {
+      html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + '</p>';
+    }
     html += '</div></div>';
   });
   el.innerHTML = html;
@@ -593,7 +709,9 @@ function renderFixBucket(rows) {
     var expandable   = hasDeal || hasMultiDeal;
     html += '<div class="row-item">';
     html += '<div class="row-summary' + (expandable ? ' clickable' : '') + '"' + (expandable ? ' onclick="toggleExpand(this)"' : '') + '>';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']) + '</span>';
+    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
+    html += '</span>';
     html += '<span class="row-reason fix-reason">' + escapeHtml(r.reason) + '</span>';
     if (expandable) html += '<span class="expand-arrow">&#9654;</span>';
     html += '</div>';
@@ -621,7 +739,9 @@ function renderSimpleBucket(containerId, rows) {
     var hasDeal = !!(r.deal && r.deal.id);
     html += '<div class="row-item">';
     html += '<div class="row-summary' + (hasDeal ? ' clickable' : '') + '"' + (hasDeal ? ' onclick="toggleExpand(this)"' : '') + '>';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']) + '</span>';
+    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
+    html += '</span>';
     if (r.reason) html += '<span class="row-meta">' + escapeHtml(r.reason) + '</span>';
     if (hasDeal) html += '<span class="expand-arrow">&#9654;</span>';
     html += '</div>';
@@ -679,16 +799,23 @@ function runImport() {
     }
   });
 
-  var toProcess = state.analyzedRows.filter(function(r) {
+  var actionable = state.analyzedRows.filter(function(r) {
     if (r.bucket === 'ready') return true;
     if (r.bucket === 'review' && r.transition && r.deal && r.includeInRun) return true;
     return false;
   });
 
-  if (toProcess.length === 0) {
+  if (actionable.length === 0) {
     alert('No rows selected to process.');
     return;
   }
+
+  // Two-pass ordering: enrollments first, then chargebacks
+  // (a deal can appear as both an enrollment and a chargeback in the same file —
+  //  the enrollment must transition Sent to PL → Enrolled PL before the chargeback can run)
+  var enrollmentRows = actionable.filter(function(r) { return !r.isChargeback; });
+  var chargebackRows = actionable.filter(function(r) { return  r.isChargeback; });
+  var toProcess      = enrollmentRows.concat(chargebackRows);
 
   showScreen('screen-progress');
   state.auditLog = [];
@@ -698,8 +825,9 @@ function runImport() {
   toProcess.forEach(function(r, i) {
     var div = document.createElement('div');
     div.className = 'progress-item';
+    var badge = r.isChargeback ? '<span class="badge-chargeback">Chargeback</span>' : '';
     div.innerHTML =
-      '<span class="progress-name">' + escapeHtml(r.row['Client Name'] || '') + '</span>' +
+      '<span class="progress-name">' + escapeHtml(r.row['Client Name'] || '') + ' ' + badge + '</span>' +
       '<span class="progress-status status-pending" id="ps-' + i + '">Pending</span>';
     progressList.appendChild(div);
   });
@@ -720,10 +848,6 @@ function runImport() {
     statusEl.textContent = 'Processing…';
     statusEl.className = 'progress-status status-processing';
 
-    var enrolledDate = normalizeDate(r.row['Date Enrolled in PL']);
-    var loanAmount   = parseFloat(String(r.row['Loan Amount']).replace(/[^0-9.]/g, '')) || 0;
-    var refFee       = parseFloat(String(r.row['Ref Fee']).replace(/[^0-9.]/g, '')) || 0;
-
     function recordOutcome(success, errorMsg) {
       statusEl.textContent = success ? 'Success ✓' : 'Failed ✗';
       statusEl.className   = 'progress-status ' + (success ? 'status-success' : 'status-failed');
@@ -741,60 +865,96 @@ function runImport() {
       processNext();
     }
 
-    var callResult;
-    try {
-      callResult = ZOHO.CRM.API.updateBluePrint({
-        Entity: 'Deals',
-        RecordID: r.deal.id,
-        BlueprintData: {
-          blueprint: [{
-            transition_id: r.transition.id,
-            data: {
-              PL_Sender_Name: { id: r.rep.userId },
-              PL_Enrolled_Date: enrolledDate,
-              Loan_Amount: loanAmount,
-              Revenue: refFee
-            }
-          }]
-        }
-      });
-    } catch (syncErr) {
-      console.error('updateBluePrint sync error:', syncErr);
-      recordOutcome(false, 'Sync error: ' + String(syncErr));
-      return;
+    if (r.isChargeback) {
+      processChargebackTransition(r, recordOutcome);
+    } else {
+      processEnrollmentTransition(r, recordOutcome);
     }
-
-    if (!callResult || typeof callResult.then !== 'function') {
-      console.error('updateBluePrint did not return a promise:', callResult);
-      recordOutcome(false, 'updateBluePrint did not return a promise');
-      return;
-    }
-
-    // Safety timeout — prevents UI from hanging if the promise never settles
-    var settled = false;
-    var timeoutId = setTimeout(function() {
-      if (settled) return;
-      settled = true;
-      console.error('updateBluePrint timed out for deal', r.deal.id);
-      recordOutcome(false, 'Request timed out after 30s');
-    }, 30000);
-
-    callResult.then(function(resp) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      var success = resp && (resp.status === 'success' || resp.code === 'SUCCESS');
-      recordOutcome(success, success ? '' : formatApiError(resp));
-    }).catch(function(err) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      console.error('updateBluePrint rejected:', JSON.stringify(err));
-      recordOutcome(false, formatApiError(err));
-    });
   }
 
   processNext();
+}
+
+function processEnrollmentTransition(r, recordOutcome) {
+  var enrolledDate = normalizeDate(r.row['Date Enrolled in PL']);
+  var loanAmount   = parseFloat(String(r.row['Loan Amount']).replace(/[^0-9.]/g, '')) || 0;
+  var refFee       = parseFloat(String(r.row['Ref Fee']).replace(/[^0-9.]/g, '')) || 0;
+
+  callBlueprintTransition(r, {
+    PL_Sender_Name:   { id: r.rep.userId },
+    PL_Enrolled_Date: enrolledDate,
+    Loan_Amount:      loanAmount,
+    Revenue:          refFee
+  }, recordOutcome);
+}
+
+function processChargebackTransition(r, recordOutcome) {
+  // Re-fetch the deal's current stage — pass 1 may have just moved it Sent to PL → Enrolled PL
+  ZOHO.CRM.API.getRecord({ Entity: 'Deals', RecordID: r.deal.id }).then(function(resp) {
+    var deal = resp && resp.data && resp.data[0];
+    if (!deal) {
+      recordOutcome(false, 'Deal not found when re-fetching');
+      return;
+    }
+    var currentStage = deal.Stage || '';
+    if (currentStage !== CONSTANTS.ENROLLED_PL_STAGE) {
+      recordOutcome(false, 'Deal not in Enrolled PL stage — cannot cancel (currently: ' + currentStage + ')');
+      return;
+    }
+    var canceledDate = normalizeDate(r.row['Cancellation Date']);
+    callBlueprintTransition(r, { PL_Canceled_Date: canceledDate }, recordOutcome);
+  }).catch(function(err) {
+    console.error('getRecord rejected for chargeback re-fetch:', JSON.stringify(err));
+    recordOutcome(false, 'Failed to fetch deal stage: ' + formatApiError(err));
+  });
+}
+
+function callBlueprintTransition(r, data, recordOutcome) {
+  var callResult;
+  try {
+    callResult = ZOHO.CRM.API.updateBluePrint({
+      Entity: 'Deals',
+      RecordID: r.deal.id,
+      BlueprintData: {
+        blueprint: [{
+          transition_id: r.transition.id,
+          data: data
+        }]
+      }
+    });
+  } catch (syncErr) {
+    console.error('updateBluePrint sync error:', syncErr);
+    recordOutcome(false, 'Sync error: ' + String(syncErr));
+    return;
+  }
+
+  if (!callResult || typeof callResult.then !== 'function') {
+    console.error('updateBluePrint did not return a promise:', callResult);
+    recordOutcome(false, 'updateBluePrint did not return a promise');
+    return;
+  }
+
+  var settled = false;
+  var timeoutId = setTimeout(function() {
+    if (settled) return;
+    settled = true;
+    console.error('updateBluePrint timed out for deal', r.deal.id);
+    recordOutcome(false, 'Request timed out after 30s');
+  }, 30000);
+
+  callResult.then(function(resp) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    var success = resp && (resp.status === 'success' || resp.code === 'SUCCESS');
+    recordOutcome(success, success ? '' : formatApiError(resp));
+  }).catch(function(err) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    console.error('updateBluePrint rejected:', JSON.stringify(err));
+    recordOutcome(false, formatApiError(err));
+  });
 }
 
 function buildSkipAndNoMatchAuditEntries() {

@@ -20,7 +20,7 @@ var CONSTANTS = {
   CANCELED_PL_STAGE: 'Canceled PL',
   FUZZY_MATCH_THRESHOLD: 0.6,
   UNASSIGNED_VALUES: ['unassigned', 'n/a', 'affiliates', 'sales agent', ''],
-  REQUIRED_COLUMNS: ['Affiliate Rep', 'Date Enrolled in PL', 'Client Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone', 'Stage', 'Cancellation Date'],
+  REQUIRED_COLUMNS: ['Affiliate Rep', 'Date Enrolled in PL', 'Client Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone', 'Stage'],
   CRM_ORG_ID: '786428921',
   FUZZY_READY_THRESHOLD: 0.85
 };

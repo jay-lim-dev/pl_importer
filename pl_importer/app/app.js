@@ -8,8 +8,9 @@ var CONSTANTS = {
     turned_down_pl: { id: '5428089000280561156', label: 'Turned Down for PL' },
     canceled_pl:    { id: '5428089000739384025', label: 'Canceled PL' }
   },
+  // Normalized stage → transition key (keys must be lowercase + non-alphanumerics stripped)
   STATUS_MAP: {
-    'closed-won': 'enrolled_pl'
+    'closedwon': 'enrolled_pl'
   },
   // Normalized stage variants (lowercase + non-alphanumerics stripped)
   CHARGEBACK_STAGE_NORM_VARIANTS: ['chargeback', 'chargaback'],
@@ -20,7 +21,7 @@ var CONSTANTS = {
   CANCELED_PL_STAGE: 'Canceled PL',
   FUZZY_MATCH_THRESHOLD: 0.6,
   UNASSIGNED_VALUES: ['unassigned', 'n/a', 'affiliates', 'sales agent', ''],
-  REQUIRED_COLUMNS: ['Affiliate Rep', 'Date Enrolled in PL', 'Client Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone', 'Stage'],
+  REQUIRED_COLUMNS: ['Affiliate Sales Rep', 'Closed Date', 'Lead Name', 'Loan Amount', 'Ref Fee', 'Email', 'Phone/Mobile', 'Lead/Opportunity Stage', 'Affiliate Lead ID'],
   CRM_ORG_ID: '786428921',
   FUZZY_READY_THRESHOLD: 0.85
 };
@@ -112,16 +113,18 @@ function formatApiError(resp) {
 function normalizeDate(val) {
   if (!val) return '';
   var s = String(val).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;                   // already ISO
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;                      // YYYY-MM-DD (ISO)
   if (/^\d{4}\/\d{2}\/\d{2}$/.test(s)) return s.replace(/\//g, '-'); // YYYY/MM/DD
+  var mmdd = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (mmdd) return mmdd[3] + '-' + mmdd[1].padStart(2, '0') + '-' + mmdd[2].padStart(2, '0'); // MM/DD/YYYY
   var serial = parseFloat(s);
-  if (!isNaN(serial) && serial > 1000) {                           // Excel serial
+  if (!isNaN(serial) && serial > 1000) {                              // Excel serial
     var d = new Date(Math.round((serial - 25569) * 86400 * 1000));
     var mm = String(d.getUTCMonth() + 1).padStart(2, '0');
     var dd = String(d.getUTCDate()).padStart(2, '0');
     return d.getUTCFullYear() + '-' + mm + '-' + dd;
   }
-  var parsed = new Date(s);                                        // fallback parse
+  var parsed = new Date(s);                                           // fallback
   if (!isNaN(parsed)) {
     var mm2 = String(parsed.getMonth() + 1).padStart(2, '0');
     var dd2 = String(parsed.getDate()).padStart(2, '0');
@@ -134,7 +137,7 @@ function getMissingFields(row) {
   var missing = [];
   if (!String(row['Ref Fee'] || '').trim()) missing.push('Revenue (Ref Fee)');
   if (!String(row['Loan Amount'] || '').trim()) missing.push('Loan Amount');
-  if (!String(row['Date Enrolled in PL'] || '').trim()) missing.push('PL Enrolled Date');
+  if (!String(row['Closed Date'] || '').trim()) missing.push('PL Enrolled Date');
   return missing;
 }
 
@@ -317,8 +320,8 @@ function searchDeals(query) {
 // Try all three tiers; stageFilter is a stage string or null (any stage)
 function tryTiers(row, stageFilter) {
   var email = (row['Email'] || '').trim();
-  var phone = (row['Phone'] || '').trim();
-  var clientName = (row['Client Name'] || '').trim();
+  var phone = (row['Phone/Mobile'] || '').trim();
+  var clientName = (row['Lead Name'] || '').trim();
 
   function buildQ(field, value) {
     var q = '(' + field + ':equals:' + value + ')';
@@ -352,25 +355,56 @@ function tryTiers(row, stageFilter) {
   });
 }
 
+// Tier 0: direct deal lookup by CRM Record ID (from the Affiliate Lead ID column).
+// Resolves with deal data on hit, or empty on miss/error so callers can fall through.
+function tryById(row) {
+  var id = (row['Affiliate Lead ID'] || '').trim();
+  if (!id) return Promise.resolve({ deals: [], tier: null });
+  return ZOHO.CRM.API.getRecord({ Entity: 'Deals', RecordID: id })
+    .then(function(resp) {
+      if (resp && resp.data && resp.data.length > 0) {
+        return { deals: resp.data, tier: 'ID' };
+      }
+      return { deals: [], tier: null };
+    })
+    .catch(function() { return { deals: [], tier: null }; });
+}
+
 function matchDeal(row) {
-  return tryTiers(row, CONSTANTS.SENT_TO_PL_STAGE).then(function(result) {
-    if (result.deals.length > 0) return result;
-    // Fallback: search without stage filter to detect wrong-stage deals
-    return tryTiers(row, null).then(function(fallback) {
-      if (fallback.deals.length === 0) return { deals: [], tier: null };
-      // If fallback found deals in Sent to PL, primary search missed them (API quirk) — treat as normal
-      var sentToPL = fallback.deals.filter(function(d) { return d.Stage === CONSTANTS.SENT_TO_PL_STAGE; });
-      if (sentToPL.length > 0) return { deals: sentToPL, tier: fallback.tier, otherStage: false };
-      return { deals: fallback.deals, tier: fallback.tier, otherStage: true };
+  var hasId = !!(row['Affiliate Lead ID'] || '').trim();
+
+  // Prefix the fall-through tier so the audit shows "ID→Email" when the ID lookup failed
+  function tagFallback(result) {
+    if (hasId && result.tier) result.tier = 'ID→' + result.tier;
+    return result;
+  }
+
+  return tryById(row).then(function(idResult) {
+    if (idResult.deals.length > 0) {
+      var deal = idResult.deals[0];
+      var otherStage = deal.Stage !== CONSTANTS.SENT_TO_PL_STAGE;
+      return { deals: [deal], tier: 'ID', otherStage: otherStage };
+    }
+
+    return tryTiers(row, CONSTANTS.SENT_TO_PL_STAGE).then(function(result) {
+      if (result.deals.length > 0) return tagFallback(result);
+      // Fallback: search without stage filter to detect wrong-stage deals
+      return tryTiers(row, null).then(function(fallback) {
+        if (fallback.deals.length === 0) return tagFallback({ deals: [], tier: null });
+        // If fallback found deals in Sent to PL, primary search missed them (API quirk) — treat as normal
+        var sentToPL = fallback.deals.filter(function(d) { return d.Stage === CONSTANTS.SENT_TO_PL_STAGE; });
+        if (sentToPL.length > 0) return tagFallback({ deals: sentToPL, tier: fallback.tier, otherStage: false });
+        return tagFallback({ deals: fallback.deals, tier: fallback.tier, otherStage: true });
+      });
     });
   });
 }
 
 // ─── Row Analysis ─────────────────────────────────────────────────────────────
 function analyzeRow(row) {
-  var stageRaw = (row['Stage'] || '').trim();
-  var cancellationDate = String(row['Cancellation Date'] || '').trim();
-  var rep = resolveRep(row['Affiliate Rep']);
+  var stageRaw = (row['Lead/Opportunity Stage'] || '').trim();
+  var cancellationDate = String(row['Chargeback Date'] || '').trim();
+  var rep = resolveRep(row['Affiliate Sales Rep']);
 
   var isCharge = isChargebackStage(stageRaw);
   var hasCancelDate = !!cancellationDate;
@@ -384,18 +418,18 @@ function analyzeRow(row) {
     });
   }
 
-  // Cross-validation: Stage and Cancellation Date must agree
+  // Cross-validation: Stage and Chargeback Date must agree
   if (isCharge && !hasCancelDate) {
     return Promise.resolve({
       row: row, bucket: 'review', subReason: 'missing_fields',
-      reason: 'Stage indicates CHARGEBACK but Cancellation Date is blank — fill in the spreadsheet',
+      reason: 'Stage indicates CHARGEBACK but Chargeback Date is blank — fill in the spreadsheet',
       rep: rep, deal: null, tier: null
     });
   }
   if (!isCharge && hasCancelDate) {
     return Promise.resolve({
       row: row, bucket: 'review', subReason: 'missing_fields',
-      reason: 'Cancellation Date set but Stage is not CHARGEBACK — please correct one of them',
+      reason: 'Chargeback Date set but Stage is not CHARGEBACK — please correct one of them',
       rep: rep, deal: null, tier: null
     });
   }
@@ -407,8 +441,7 @@ function analyzeRow(row) {
 }
 
 function analyzeEnrollmentRow(row, rep, stageRaw) {
-  var stageLower = stageRaw.toLowerCase();
-  var transitionKey = CONSTANTS.STATUS_MAP[stageLower];
+  var transitionKey = CONSTANTS.STATUS_MAP[normalizeStage(stageRaw)];
   var transition = transitionKey ? CONSTANTS.TRANSITIONS[transitionKey] : null;
 
   return matchDeal(row).then(function(matchResult) {
@@ -631,7 +664,7 @@ function renderReadyBucket(rows) {
   rows.forEach(function(r) {
     html += '<div class="row-item">';
     html += '<div class="row-summary clickable" onclick="toggleExpand(this)">';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    html += '<span class="row-name">' + escapeHtml(r.row['Lead Name']);
     if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
     html += '</span>';
     if (r.isChargeback) {
@@ -648,11 +681,11 @@ function renderReadyBucket(rows) {
     html += '<p><strong>Match method:</strong> ' + escapeHtml(r.tier) + '</p>';
     html += '<p><strong>Transition:</strong> ' + escapeHtml(r.transition.label) + '</p>';
     if (r.isChargeback) {
-      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Cancellation Date'])) + '</p>';
+      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Chargeback Date'])) + '</p>';
     } else {
       html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + (r.rep.confidence !== null && !r.rep.defaulted ? ' (' + Math.round(r.rep.confidence * 100) + '% confidence)' : '') + '</p>';
       html += '<p><strong>Loan Amount:</strong> ' + escapeHtml(r.row['Loan Amount']) + ' &nbsp; <strong>Revenue:</strong> ' + escapeHtml(r.row['Ref Fee']) + '</p>';
-      html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Date Enrolled in PL'])) + '</p>';
+      html += '<p><strong>PL Enrolled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Closed Date'])) + '</p>';
     }
     html += '</div></div>';
   });
@@ -669,7 +702,7 @@ function renderReviewOnlyBucket(rows) {
 
     html += '<div class="row-summary clickable" onclick="toggleExpand(this)">';
     html += '<input type="checkbox" class="review-checkbox" data-analyzed-idx="' + r._analyzedIdx + '" ' + (r.includeInRun ? 'checked' : '') + ' onclick="event.stopPropagation()">';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    html += '<span class="row-name">' + escapeHtml(r.row['Lead Name']);
     if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
     html += '</span>';
     html += '<span class="row-reason warning">' + escapeHtml(r.reason) + '</span>';
@@ -680,7 +713,7 @@ function renderReviewOnlyBucket(rows) {
       html += '<div class="rep-confirm-row">';
       html += '<label class="rep-confirm-label">PL Sender Name:</label>';
       html += buildRepSelectHtml(r._analyzedIdx, r.rep.userId);
-      html += '<span class="rep-file-value">file says: &ldquo;' + escapeHtml(r.row['Affiliate Rep'] || '') + '&rdquo;</span>';
+      html += '<span class="rep-file-value">file says: &ldquo;' + escapeHtml(r.row['Affiliate Sales Rep'] || '') + '&rdquo;</span>';
       html += '</div>';
     }
 
@@ -689,7 +722,7 @@ function renderReviewOnlyBucket(rows) {
     html += '<p><strong>Match method:</strong> ' + escapeHtml(r.tier) + '</p>';
     if (r.transition) html += '<p><strong>Transition:</strong> ' + escapeHtml(r.transition.label) + '</p>';
     if (r.isChargeback) {
-      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Cancellation Date'])) + '</p>';
+      html += '<p><strong>PL Canceled Date:</strong> ' + escapeHtml(normalizeDate(r.row['Chargeback Date'])) + '</p>';
     } else if (!isFuzzy) {
       html += '<p><strong>PL Sender Name:</strong> ' + escapeHtml(repDisplayName(r.rep)) + '</p>';
     }
@@ -709,7 +742,7 @@ function renderFixBucket(rows) {
     var expandable   = hasDeal || hasMultiDeal;
     html += '<div class="row-item">';
     html += '<div class="row-summary' + (expandable ? ' clickable' : '') + '"' + (expandable ? ' onclick="toggleExpand(this)"' : '') + '>';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    html += '<span class="row-name">' + escapeHtml(r.row['Lead Name']);
     if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
     html += '</span>';
     html += '<span class="row-reason fix-reason">' + escapeHtml(r.reason) + '</span>';
@@ -739,7 +772,7 @@ function renderSimpleBucket(containerId, rows) {
     var hasDeal = !!(r.deal && r.deal.id);
     html += '<div class="row-item">';
     html += '<div class="row-summary' + (hasDeal ? ' clickable' : '') + '"' + (hasDeal ? ' onclick="toggleExpand(this)"' : '') + '>';
-    html += '<span class="row-name">' + escapeHtml(r.row['Client Name']);
+    html += '<span class="row-name">' + escapeHtml(r.row['Lead Name']);
     if (r.isChargeback) html += ' <span class="badge-chargeback">Chargeback</span>';
     html += '</span>';
     if (r.reason) html += '<span class="row-meta">' + escapeHtml(r.reason) + '</span>';
@@ -827,7 +860,7 @@ function runImport() {
     div.className = 'progress-item';
     var badge = r.isChargeback ? '<span class="badge-chargeback">Chargeback</span>' : '';
     div.innerHTML =
-      '<span class="progress-name">' + escapeHtml(r.row['Client Name'] || '') + ' ' + badge + '</span>' +
+      '<span class="progress-name">' + escapeHtml(r.row['Lead Name'] || '') + ' ' + badge + '</span>' +
       '<span class="progress-status status-pending" id="ps-' + i + '">Pending</span>';
     progressList.appendChild(div);
   });
@@ -852,7 +885,7 @@ function runImport() {
       statusEl.textContent = success ? 'Success ✓' : 'Failed ✗';
       statusEl.className   = 'progress-status ' + (success ? 'status-success' : 'status-failed');
       state.auditLog.push({
-        clientName:  r.row['Client Name'] || '',
+        clientName:  r.row['Lead Name'] || '',
         email:       r.row['Email'] || '',
         outcome:     success ? 'Transitioned' : 'Failed',
         transition:  r.transition.label,
@@ -876,7 +909,7 @@ function runImport() {
 }
 
 function processEnrollmentTransition(r, recordOutcome) {
-  var enrolledDate = normalizeDate(r.row['Date Enrolled in PL']);
+  var enrolledDate = normalizeDate(r.row['Closed Date']);
   var loanAmount   = parseFloat(String(r.row['Loan Amount']).replace(/[^0-9.]/g, '')) || 0;
   var refFee       = parseFloat(String(r.row['Ref Fee']).replace(/[^0-9.]/g, '')) || 0;
 
@@ -901,7 +934,7 @@ function processChargebackTransition(r, recordOutcome) {
       recordOutcome(false, 'Deal not in Enrolled PL stage — cannot cancel (currently: ' + currentStage + ')');
       return;
     }
-    var canceledDate = normalizeDate(r.row['Cancellation Date']);
+    var canceledDate = normalizeDate(r.row['Chargeback Date']);
     callBlueprintTransition(r, { PL_Canceled_Date: canceledDate }, recordOutcome);
   }).catch(function(err) {
     console.error('getRecord rejected for chargeback re-fetch:', JSON.stringify(err));
@@ -965,7 +998,7 @@ function buildSkipAndNoMatchAuditEntries() {
     if (wasProcessed) return;
 
     var entry = {
-      clientName:  r.row['Client Name'] || '',
+      clientName:  r.row['Lead Name'] || '',
       email:       r.row['Email'] || '',
       outcome:     '',
       transition:  '—',
@@ -1051,7 +1084,7 @@ function renderAuditReport() {
 }
 
 function exportCsv() {
-  var headers = ['Client Name', 'Email', 'Outcome', 'Transition', 'Deal ID', 'Match Method', 'Rep Resolved', 'Error', 'Timestamp'];
+  var headers = ['Lead Name', 'Email', 'Outcome', 'Transition', 'Deal ID', 'Match Method', 'Rep Resolved', 'Error', 'Timestamp'];
   var lines = [headers.map(csvEsc).join(',')];
   state.auditLog.forEach(function(l) {
     lines.push([
@@ -1072,6 +1105,24 @@ function csvEsc(val) {
   var s = String(val === null || val === undefined ? '' : val);
   if (s.includes(',') || s.includes('"') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"';
   return s;
+}
+
+function downloadTemplate() {
+  var cols = ['Lead Name', 'Loan Amount', 'Ref Fee', 'Closed Date', 'Chargeback Date',
+              'Lead/Opportunity Stage', 'Affiliate Lead ID', 'Affiliate Sales Rep', 'Phone/Mobile', 'Email'];
+  var rows = [
+    ['Jane Smith', '15000', '1500', '2026-06-01', '', 'Closed Won', '5428089000000000001', 'Kyle Kimball', '+1 555-100-0001', 'jane.smith@example.com'],
+    ['John Doe',   '12000', '1200', '2026-05-15', '2026-06-01', 'CHARGEBACK', '5428089000000000002', 'Kyle Kimball', '+1 555-100-0002', 'john.doe@example.com']
+  ];
+  var lines = [cols.map(csvEsc).join(',')];
+  rows.forEach(function(r) { lines.push(r.map(csvEsc).join(',')); });
+  var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a');
+  a.href = url;
+  a.download = 'pl_import_template.csv';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ─── File Handling ────────────────────────────────────────────────────────────

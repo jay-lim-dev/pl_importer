@@ -62,33 +62,39 @@ The widget accepts `.xlsx` and `.csv` files with **exactly** these column header
 
 | Column | Maps To | CRM API Name |
 |---|---|---|
-| `Affiliate Rep` | PL Sender Name | `PL_Sender_Name` |
-| `Date Enrolled in PL` | PL Enrolled Date | `PL_Enrolled_Date` |
-| `Client Name` | Deal matching (Tier 3) | — |
+| `Affiliate Lead ID` | Deal matching (Tier 0 — direct record ID) | — |
+| `Lead Name` | Deal matching (Tier 3) | — |
+| `Email` | Deal matching (Tier 1) | — |
+| `Phone/Mobile` | Deal matching (Tier 2) | — |
+| `Lead/Opportunity Stage` | Determines transition | — |
+| `Affiliate Sales Rep` | PL Sender Name | `PL_Sender_Name` |
+| `Closed Date` | PL Enrolled Date | `PL_Enrolled_Date` |
 | `Loan Amount` | Loan Amount | `Loan_Amount` |
 | `Ref Fee` | Revenue | `Revenue` |
-| `Email` | Deal matching (Tier 1) | — |
-| `Phone` | Deal matching (Tier 2) | — |
-| `Stage` | Determines transition | — |
-| `Cancellation Date` | PL Canceled Date (chargeback rows only) | `PL_Canceled_Date` |
+| `Chargeback Date` | PL Canceled Date (chargeback rows only) | `PL_Canceled_Date` |
 
-`Cancellation Date` is optional — only needed if the file contains chargeback rows. If the column is absent and a row has `Stage = CHARGEBACK`, that row is flagged as Fix Required. All other required columns halt the import if missing.
+`Chargeback Date` is optional — only needed if the file contains chargeback rows. If the column is absent and a row has `Lead/Opportunity Stage = CHARGEBACK`, that row is flagged as Fix Required. All other required columns halt the import if missing.
+
+Accepted date formats: `YYYY-MM-DD`, `MM/DD/YYYY`, `YYYY/MM/DD`, Excel serial numbers.
 
 ---
 
 ## How It Works
 
-### Deal Matching (3-tier)
+### Deal Matching (4-tier)
 Each row is matched to a CRM Deal **currently in "Sent to PL"** stage:
 
-1. **Tier 1 — Email** (`Email:equals:value`)
-2. **Tier 2 — Phone** (digits-only with country code, e.g. `19173528296`)
-3. **Tier 3 — Client Name** (`Contact_Name.name:equals:value`) — treated as low-confidence
+1. **Tier 0 — Affiliate Lead ID** (`ZOHO.CRM.API.getRecord` by record ID) — direct lookup, ~100% reliable
+2. **Tier 1 — Email** (`Email:equals:value`)
+3. **Tier 2 — Phone** (`Phone/Mobile` value, digits-only with country code)
+4. **Tier 3 — Lead Name** (`Contact_Name.name:equals:value`) — treated as low-confidence
+
+If Tier 0 is present but the record is not found, the importer silently falls through to Tiers 1–3. The audit report reflects this as `ID→Email`, `ID→Phone`, or `ID→Name` in the Match Method column.
 
 If no match is found in "Sent to PL", a fallback search checks all stages to detect deals already processed.
 
 ### Rep Name Resolution
-Affiliate Rep values are fuzzy-matched against CRM active users:
+`Affiliate Sales Rep` values are fuzzy-matched against CRM active users:
 
 | Confidence | Behaviour |
 |---|---|
@@ -101,15 +107,15 @@ Affiliate Rep values are fuzzy-matched against CRM active users:
 
 ### Stage → Blueprint Transition Mapping
 
-Row type is determined by **cross-validating** the `Stage` column with the `Cancellation Date` column. Both must agree, or the row is flagged for Fix Required.
+Row type is determined by **cross-validating** the `Lead/Opportunity Stage` column with the `Chargeback Date` column. Both must agree, or the row is flagged for Fix Required.
 
-| Spreadsheet Stage | Cancellation Date | Transition | Transition ID |
+| Spreadsheet Stage | Chargeback Date | Transition | Transition ID |
 |---|---|---|---|
-| `Closed-Won` | blank | `Sent to PL → Enrolled PL` | `5428089000006963030` |
+| `Closed Won` (case-insensitive, ignores spaces/dashes) | blank | `Sent to PL → Enrolled PL` | `5428089000006963030` |
 | `CHARGEBACK` / `CHARGABACK` (case-insensitive, ignores spaces/dashes) | populated | `Enrolled PL → Canceled PL` | `5428089000739384025` |
 | `FEE ADJUSTMENT` / `Fee Adjustment` | — | Pending clarification — skipped | — |
-| `CHARGEBACK` variant | **blank** | Fix Required — missing Cancellation Date | — |
-| `Closed-Won` | **populated** | Fix Required — Cancellation Date set but Stage isn't CHARGEBACK | — |
+| `CHARGEBACK` variant | **blank** | Fix Required — missing Chargeback Date | — |
+| `Closed Won` | **populated** | Fix Required — Chargeback Date set but Stage isn't CHARGEBACK | — |
 
 ### Two-Pass Processing Order
 
@@ -137,7 +143,7 @@ Sections and summary counts with zero rows are hidden automatically.
 
 Every row (processed or skipped) appears in the audit report with:
 
-- Client Name, Email, Outcome, Transition called, Deal ID, Match Method, Rep Resolved, Error message, Timestamp
+- Lead Name, Email, Outcome, Transition called, Deal ID, Match Method, Rep Resolved, Error message, Timestamp
 
 **Outcomes:** `Transitioned` / `Failed` / `Skipped` / `Skipped (manual)` / `No Match` / `Pending Clarification` / `Fix Required`
 
